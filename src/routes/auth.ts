@@ -1,15 +1,14 @@
 import { sha256Hex } from "../hex";
+import { buildMobileSetupUrl, renderSetupQrDataUrl } from "../setupQr";
 import type { StoredServerConfig } from "../config";
 import {
-	SERVER_MAX_SCHEMA_VERSION,
-	SERVER_MIGRATION_REQUIRED,
 	SERVER_MIN_PLUGIN_VERSION,
-	SERVER_MIN_SCHEMA_VERSION,
 	SERVER_RECOMMENDED_PLUGIN_VERSION,
+	SERVER_SCHEMA_VERSION,
 	SERVER_VERSION,
 } from "../version";
 import { json } from "./http";
-import type { AuthState, Env, UpdateProvider } from "./types";
+import type { AuthState, AuthStateCached, Env, UpdateProvider } from "./types";
 import { MAX_BLOB_UPLOAD_BYTES } from "../contracts";
 
 export function getHttpAuthToken(req: Request): string | null {
@@ -48,6 +47,50 @@ export async function getStoredServerConfig(env: Env): Promise<StoredServerConfi
 		throw new Error(`config fetch failed (${res.status})`);
 	}
 	return await res.json();
+}
+
+// ── Config cache (issue #40 — stop per-request DO round-trips) ───────────────
+//
+// getStoredServerConfig() does a live Durable Object fetch every call.  In
+// claim mode that fires on every Worker request.  Cache the config for a short
+// TTL so a reconnect storm or scanner traffic does not each become a separate
+// YAOS_CONFIG subrequest.
+//
+// Security note: we cache the *stored* config (tokenHash, updateProvider etc.),
+// not the auth decision itself.  Token verification still runs on every request
+// against the cached tokenHash — we just avoid re-fetching the hash from the DO
+// on every request.
+//
+// The cache is invalidated after /claim and /api/update-metadata writes so that
+// the operator sees the new state immediately on the next request.
+
+const AUTH_CONFIG_CACHE_TTL_MS = 60_000;
+
+let cachedConfig: { value: StoredServerConfig; expiresAt: number } | null = null;
+let configInflight: Promise<StoredServerConfig> | null = null;
+
+export function invalidateStoredServerConfigCache(): void {
+	cachedConfig = null;
+	configInflight = null;
+}
+
+export async function getStoredServerConfigCached(env: Env): Promise<StoredServerConfig> {
+	const now = Date.now();
+	if (cachedConfig && cachedConfig.expiresAt > now) {
+		return cachedConfig.value;
+	}
+	if (configInflight) {
+		return configInflight;
+	}
+	configInflight = getStoredServerConfig(env)
+		.then((config) => {
+			cachedConfig = { value: config, expiresAt: Date.now() + AUTH_CONFIG_CACHE_TTL_MS };
+			return config;
+		})
+		.finally(() => {
+			configInflight = null;
+		});
+	return configInflight;
 }
 
 async function claimServerConfig(env: Env, tokenHash: string): Promise<boolean> {
@@ -100,6 +143,27 @@ export async function getAuthState(env: Env): Promise<AuthState> {
 	}
 
 	return { mode: "unclaimed", claimed: false };
+}
+
+/**
+ * Cached variant of getAuthState.  Uses getStoredServerConfigCached so that
+ * repeated requests within AUTH_CONFIG_CACHE_TTL_MS share a single YAOS_CONFIG
+ * subrequest instead of each paying a DO round-trip.  The cached AuthState
+ * carries the full StoredServerConfig in claim/unclaimed modes so callers can
+ * reuse it without a second fetch (e.g. /api/capabilities).
+ */
+export async function getAuthStateCached(env: Env): Promise<AuthStateCached> {
+	const envToken = env.SYNC_TOKEN?.trim();
+	if (envToken) {
+		return { mode: "env", claimed: true, envToken };
+	}
+
+	const config = await getStoredServerConfigCached(env);
+	if (config.claimed && typeof config.tokenHash === "string" && config.tokenHash.length > 0) {
+		return { mode: "claim", claimed: true, tokenHash: config.tokenHash, config };
+	}
+
+	return { mode: "unclaimed", claimed: false, config };
 }
 
 export async function isAuthorized(
@@ -173,12 +237,11 @@ export function getCapabilities(
 	attachments: boolean;
 	snapshots: boolean;
 	maxBlobUploadBytes: number;
+	socketTicketAuth: boolean;
 	serverVersion: string;
 	minPluginVersion: string | null;
 	recommendedPluginVersion: string | null;
-	minSchemaVersion: number | null;
-	maxSchemaVersion: number | null;
-	migrationRequired: boolean;
+	schemaVersion: number;
 	updateProvider: UpdateProvider | null;
 	updateRepoUrl: string | null;
 	updateRepoBranch: string | null;
@@ -190,12 +253,11 @@ export function getCapabilities(
 		attachments: bucketEnabled,
 		snapshots: bucketEnabled,
 		maxBlobUploadBytes: MAX_BLOB_UPLOAD_BYTES,
+		socketTicketAuth: true,
 		serverVersion: SERVER_VERSION,
 		minPluginVersion: SERVER_MIN_PLUGIN_VERSION,
 		recommendedPluginVersion: SERVER_RECOMMENDED_PLUGIN_VERSION,
-		minSchemaVersion: SERVER_MIN_SCHEMA_VERSION,
-		maxSchemaVersion: SERVER_MAX_SCHEMA_VERSION,
-		migrationRequired: SERVER_MIGRATION_REQUIRED,
+		schemaVersion: SERVER_SCHEMA_VERSION,
 		updateProvider: options.includePrivateUpdateMetadata ? (config?.updateProvider ?? null) : null,
 		updateRepoUrl: options.includePrivateUpdateMetadata ? (config?.updateRepoUrl ?? null) : null,
 		updateRepoBranch: options.includePrivateUpdateMetadata ? (config?.updateRepoBranch ?? null) : null,
@@ -224,11 +286,25 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 
 	const token = body.token.trim();
 	const vaultId = typeof body.vaultId === "string" ? body.vaultId.trim() : "";
+	let mobileSetupQrDataUrl: string;
+	try {
+		// Render before the durable claim write. A renderer failure must not leave
+		// an otherwise functional server irreversibly claimed with a failed setup UI.
+		mobileSetupQrDataUrl = await renderSetupQrDataUrl(
+			buildMobileSetupUrl(url.origin, token, vaultId),
+		);
+	} catch {
+		return json({ error: "setup QR generation failed" }, 500);
+	}
+
 	const tokenHash = await hashToken(token);
 	const claimed = await claimServerConfig(env, tokenHash);
 	if (!claimed) {
 		return json({ error: "already_claimed" }, 403);
 	}
+	// Invalidate the cached config so the next request sees the claimed state
+	// immediately rather than serving a stale unclaimed response for up to TTL.
+	invalidateStoredServerConfigCache();
 
 	let claimedConfig: StoredServerConfig | null = null;
 	try {
@@ -241,6 +317,7 @@ export async function handleClaimRoute(req: Request, env: Env, authState: AuthSt
 		ok: true,
 		host: url.origin,
 		obsidianUrl: buildObsidianSetupUrl(url.origin, token, vaultId || undefined),
+		mobileSetupQrDataUrl,
 		capabilities: getCapabilities(
 			{ mode: "claim", claimed: true, tokenHash },
 			env,
@@ -285,6 +362,8 @@ export async function handleUpdateMetadataRoute(req: Request, env: Env, authStat
 				: 500;
 		return json({ error: message }, status);
 	}
+	// Invalidate cache so the next request sees the updated metadata immediately.
+	invalidateStoredServerConfigCache();
 
 	return json({
 		ok: true,
